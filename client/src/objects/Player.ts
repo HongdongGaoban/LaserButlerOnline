@@ -1,27 +1,33 @@
 import Phaser from 'phaser';
-import { PLAYER, LASER, PLAYER_COLORS, JOYSTICK } from '../config';
-import { Laser, WallSegment } from './Laser';
+import { PLAYER, LASER, PLAYER_COLORS, JOYSTICK, MAP_WIDTH, MAP_HEIGHT, SUB_WEAPON } from '../config';
+import { Laser, WallRect, WallSegment } from './Laser';
 import { normalize } from '../utils/Vector';
 
 export type SubWeaponType = 'bomb' | 'dash' | 'mud' | 'stone';
 
-interface PlayerState {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  hasBarrier: boolean;
-  speedMultiplier: number;
+export interface TrapData {
+  x: number; y: number;
+  type: 'mud' | 'stone';
+  ownerId: string;
+  radius: number;
+  graphics: Phaser.GameObjects.Graphics;
+}
+
+export interface BombData {
+  x: number; y: number;
+  ownerId: string;
+  graphics: Phaser.GameObjects.Graphics;
+  timer: Phaser.Time.TimerEvent;
 }
 
 /**
- * プレイヤークラス
- * ローカルプレイヤーとリモートプレイヤーを兼用（isLocal フラグで切り替え）
+ * プレイヤークラス（ローカルプレイヤー・AIボット兼用）
  */
 export class Player {
   readonly id: string;
   readonly colorIndex: number;
   readonly isLocal: boolean;
+  name: string;
 
   x: number;
   y: number;
@@ -29,30 +35,38 @@ export class Player {
   private vy = 0;
 
   private graphics: Phaser.GameObjects.Graphics;
-  private nameText: Phaser.GameObjects.Text;
-  private hpText: Phaser.GameObjects.Text;
+  private labelText: Phaser.GameObjects.Text;
 
-  private alive = true;
-  private invincible = false;
+  private _alive = true;
   private invincibleUntil = 0;
-  private hasBarrier = false;
+  hasBarrier = false;
   private speedMultiplier = 1.0;
   private speedBoostUntil = 0;
+  private stunUntil = 0;
+  private isDashing = false;
+  private dashUntil = 0;
 
   // 射撃
   private lastFireTime = 0;
-  private firingDirection = { x: 0, y: 0 };
+  private aimDirX = 1;
+  private aimDirY = 0;
   private isFiring = false;
 
   // サブ装備
   subWeapons: [SubWeaponType, SubWeaponType] = ['bomb', 'dash'];
+  subStockA: number;
+  subStockB: number;
 
   // 統計
   kills = 0;
   deaths = 0;
 
+  // ボム投擲の準備中（ドラッグ座標）
+  bombTargetX = 0;
+  bombTargetY = 0;
+  isPreparingBomb = false;
+
   private scene: Phaser.Scene;
-  private lasers: Laser[] = [];
 
   constructor(
     scene: Phaser.Scene,
@@ -62,162 +76,208 @@ export class Player {
     colorIndex: number,
     name: string,
     isLocal: boolean,
+    subWeapons: [SubWeaponType, SubWeaponType] = ['bomb', 'dash'],
   ) {
     this.scene = scene;
     this.id = id;
     this.x = x;
     this.y = y;
     this.colorIndex = colorIndex;
+    this.name = name;
     this.isLocal = isLocal;
+    this.subWeapons = subWeapons;
+    this.subStockA = this.getMaxStock(subWeapons[0]);
+    this.subStockB = this.getMaxStock(subWeapons[1]);
 
     this.graphics = scene.add.graphics();
-
-    // 名前表示
-    this.nameText = scene.add.text(x, y - PLAYER.RADIUS - 20, name, {
-      fontSize: '12px',
+    this.labelText = scene.add.text(x, y - PLAYER.RADIUS - 20, name, {
+      fontSize: '11px',
       fontFamily: 'monospace',
       color: `#${PLAYER_COLORS[colorIndex].toString(16).padStart(6, '0')}`,
-    }).setOrigin(0.5);
-
-    // HP表示（残機）
-    this.hpText = scene.add.text(x, y - PLAYER.RADIUS - 6, '●', {
-      fontSize: '10px',
-      fontFamily: 'monospace',
-      color: '#00ff00',
-    }).setOrigin(0.5);
+    }).setOrigin(0.5).setDepth(10);
   }
 
-  get isAlive(): boolean {
-    return this.alive;
+  get alive(): boolean { return this._alive; }
+  get isInvincible(): boolean { return this.scene.time.now < this.invincibleUntil; }
+  get currentSpeed(): number {
+    const now = this.scene.time.now;
+    if (now < this.stunUntil) return 0;
+    const mult = now < this.speedBoostUntil ? this.speedMultiplier : 1.0;
+    return PLAYER.SPEED * mult;
   }
 
-  /** 移動入力を設定（バーチャルジョイスティックから） */
+  /** ローカルプレイヤー用：移動入力（ジョイスティックから正規化済み） */
   setMoveInput(inputX: number, inputY: number): void {
-    if (!this.isLocal) return;
-
     const len = Math.sqrt(inputX * inputX + inputY * inputY);
     if (len < JOYSTICK.DEADZONE) {
-      this.vx = 0;
-      this.vy = 0;
-      return;
+      this.vx = 0; this.vy = 0; return;
     }
-
-    // デジタル補正: 閾値以上なら最大速度
-    const speed = len >= JOYSTICK.DIGITAL_THRESHOLD
-      ? PLAYER.SPEED * this.speedMultiplier
-      : PLAYER.SPEED * this.speedMultiplier * (len / JOYSTICK.DIGITAL_THRESHOLD);
-
+    const speed = len >= JOYSTICK.DIGITAL_THRESHOLD ? this.currentSpeed : this.currentSpeed * (len / JOYSTICK.DIGITAL_THRESHOLD);
     const nx = inputX / len;
     const ny = inputY / len;
     this.vx = nx * speed;
     this.vy = ny * speed;
   }
 
-  /** 照準方向を設定（右バーチャルジョイスティックから） */
+  /** ローカルプレイヤー用：照準入力 */
   setAimInput(aimX: number, aimY: number, firing: boolean): void {
-    if (!this.isLocal) return;
     const len = Math.sqrt(aimX * aimX + aimY * aimY);
-    if (len > 0.1) {
-      this.firingDirection = normalize({ x: aimX, y: aimY });
+    if (len > 0.05) {
+      this.aimDirX = aimX / len;
+      this.aimDirY = aimY / len;
     }
     this.isFiring = firing;
   }
 
-  update(delta: number, walls: WallSegment[]): Laser[] {
-    const newLasers: Laser[] = [];
+  /** AIボット用：速度を直接セット */
+  setVelocity(vx: number, vy: number): void {
+    this.vx = vx;
+    this.vy = vy;
+  }
 
-    if (!this.alive) {
-      return newLasers;
+  /** AIボット用：照準方向をセット */
+  setAimDir(dx: number, dy: number): void {
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len > 0.001) {
+      this.aimDirX = dx / len;
+      this.aimDirY = dy / len;
     }
+  }
+
+  setFiring(v: boolean): void { this.isFiring = v; }
+
+  getAimDir(): { x: number; y: number } {
+    return { x: this.aimDirX, y: this.aimDirY };
+  }
+
+  /**
+   * フレーム更新。生成したレーザーを返す。
+   */
+  update(delta: number, walls: WallRect[], allWallSegs: WallSegment[]): Laser[] {
+    const newLasers: Laser[] = [];
+    if (!this._alive) return newLasers;
 
     const now = this.scene.time.now;
 
-    // 無敵時間終了チェック
-    if (this.invincible && now > this.invincibleUntil) {
-      this.invincible = false;
+    // ダッシュ終了チェック
+    if (this.isDashing && now > this.dashUntil) {
+      this.isDashing = false;
+      this.vx = 0; this.vy = 0;
     }
 
-    // スピードブースト終了チェック
-    if (this.speedMultiplier > 1 && now > this.speedBoostUntil) {
-      this.speedMultiplier = 1;
-    }
-
-    // 移動（ローカルのみ、リモートは補間で動かす）
-    if (this.isLocal) {
+    // 移動
+    if (!this.isDashing) {
       this.x += this.vx * (delta / 1000);
       this.y += this.vy * (delta / 1000);
-
-      // TODO: 壁との衝突処理
+    } else {
+      // ダッシュ中も壁判定が必要
+      const dashSpeed = SUB_WEAPON.DASH.SPEED;
+      const dir = normalize({ x: this.aimDirX, y: this.aimDirY });
+      this.x += dir.x * dashSpeed * (delta / 1000);
+      this.y += dir.y * dashSpeed * (delta / 1000);
     }
 
+    // マップ境界クランプ
+    this.x = Math.max(PLAYER.RADIUS, Math.min(MAP_WIDTH - PLAYER.RADIUS, this.x));
+    this.y = Math.max(PLAYER.RADIUS, Math.min(MAP_HEIGHT - PLAYER.RADIUS, this.y));
+
+    // 壁との衝突解決
+    this.resolveWallCollisions(walls);
+
     // 射撃
-    if (this.isLocal && this.isFiring) {
-      if (now - this.lastFireTime >= LASER.FIRE_INTERVAL) {
-        this.lastFireTime = now;
-        const laser = new Laser(
-          this.scene,
-          this.x,
-          this.y,
-          this.firingDirection.x,
-          this.firingDirection.y,
-          this.id,
-          this.colorIndex,
-        );
-        newLasers.push(laser);
-      }
+    if (this.isFiring && now - this.lastFireTime >= LASER.FIRE_INTERVAL) {
+      this.lastFireTime = now;
+      newLasers.push(new Laser(
+        this.scene, this.x, this.y,
+        this.aimDirX, this.aimDirY,
+        this.id, this.colorIndex,
+      ));
     }
 
     this.draw(now);
     return newLasers;
+
+    void allWallSegs; // 現在未使用（将来の拡張用）
   }
 
-  /** リモートプレイヤーの状態を同期 */
-  applyRemoteState(state: PlayerState): void {
-    if (this.isLocal) return;
-    // 線形補間で滑らかに移動
-    this.x += (state.x - this.x) * 0.3;
-    this.y += (state.y - this.y) * 0.3;
-    this.hasBarrier = state.hasBarrier;
+  /** ダッシュを実行 */
+  doDash(): void {
+    if (this.isDashing) return;
+    this.isDashing = true;
+    const now = this.scene.time.now;
+    this.dashUntil = now + SUB_WEAPON.DASH.DISTANCE / SUB_WEAPON.DASH.SPEED * 1000;
+    // ダッシュ中は無敵
+    this.invincibleUntil = Math.max(this.invincibleUntil, now + SUB_WEAPON.DASH.INVINCIBLE_DURATION);
   }
 
-  /** レーザーに当たったとき */
-  onHit(laser: Laser): boolean {
-    if (!this.alive || this.invincible) return false;
-
+  /** レーザーに当たったとき。死亡した場合はtrueを返す */
+  onHit(): boolean {
+    if (!this._alive || this.isInvincible) return false;
     if (this.hasBarrier) {
       this.hasBarrier = false;
-      return false;  // バリアが防いだ
+      // バリア破砕エフェクト
+      this.showBarrierBreak();
+      return false;
     }
-
     this.die();
     return true;
   }
 
+  private showBarrierBreak(): void {
+    const g = this.scene.add.graphics();
+    g.lineStyle(3, 0xffffff, 1);
+    g.strokeCircle(this.x, this.y, PLAYER.RADIUS + 10);
+    this.scene.tweens.add({
+      targets: g,
+      alpha: 0,
+      duration: 300,
+      onComplete: () => g.destroy(),
+    });
+  }
+
   private die(): void {
-    this.alive = false;
-    this.vx = 0;
-    this.vy = 0;
+    this._alive = false;
+    this.vx = 0; this.vy = 0;
     this.deaths++;
+
+    // 死亡エフェクト（パーティクル風）
+    const color = PLAYER_COLORS[this.colorIndex];
+    for (let i = 0; i < 8; i++) {
+      const angle = (i / 8) * Math.PI * 2;
+      const g = this.scene.add.graphics();
+      g.fillStyle(color, 1);
+      g.fillCircle(this.x, this.y, 4);
+      this.scene.tweens.add({
+        targets: g,
+        x: g.x + Math.cos(angle) * 40,
+        y: g.y + Math.sin(angle) * 40,
+        alpha: 0,
+        duration: 400,
+        ease: 'Power2',
+        onComplete: () => g.destroy(),
+      });
+    }
+
     this.graphics.clear();
-    // TODO: 死亡エフェクト（爆発パーティクル）
+    this.labelText.setVisible(false);
   }
 
   /** リスポーン */
   respawn(x: number, y: number): void {
-    this.alive = true;
-    this.x = x;
-    this.y = y;
-    this.vx = 0;
-    this.vy = 0;
+    this._alive = true;
+    this.x = x; this.y = y;
+    this.vx = 0; this.vy = 0;
     this.hasBarrier = false;
     this.speedMultiplier = 1;
-    this.invincible = true;
-    this.invincibleUntil = this.scene.time.now + 2000;  // 2秒間の無敵
+    this.invincibleUntil = this.scene.time.now + PLAYER.INVINCIBLE_AFTER_RESPAWN;
+    this.isDashing = false;
+    // サブ装備を全回復
+    this.subStockA = this.getMaxStock(this.subWeapons[0]);
+    this.subStockB = this.getMaxStock(this.subWeapons[1]);
+    this.labelText.setVisible(true);
   }
 
-  applyBarrier(): void {
-    this.hasBarrier = true;
-  }
+  applyBarrier(): void { this.hasBarrier = true; }
 
   applySpeedBoost(multiplier: number, duration: number): void {
     this.speedMultiplier = multiplier;
@@ -225,14 +285,7 @@ export class Player {
   }
 
   applyStun(duration: number): void {
-    const prevVx = this.vx;
-    const prevVy = this.vy;
-    this.vx = 0;
-    this.vy = 0;
-    this.scene.time.delayedCall(duration, () => {
-      this.vx = prevVx;
-      this.vy = prevVy;
-    });
+    this.stunUntil = this.scene.time.now + duration;
   }
 
   applySlow(rate: number, duration: number): void {
@@ -240,42 +293,98 @@ export class Player {
     this.speedBoostUntil = this.scene.time.now + duration;
   }
 
+  private getMaxStock(type: SubWeaponType): number {
+    switch (type) {
+      case 'bomb':  return SUB_WEAPON.BOMB.MAX_STOCK;
+      case 'dash':  return SUB_WEAPON.DASH.MAX_STOCK;
+      case 'mud':   return SUB_WEAPON.MUD_TRAP.MAX_STOCK;
+      case 'stone': return SUB_WEAPON.STONE_TRAP.MAX_STOCK;
+    }
+  }
+
+  /** 矩形壁とのAABB（円-矩形）衝突を解決 */
+  private resolveWallCollisions(walls: WallRect[]): void {
+    for (const wall of walls) {
+      // 円の中心から矩形への最近接点
+      const nearX = Math.max(wall.x, Math.min(this.x, wall.x + wall.width));
+      const nearY = Math.max(wall.y, Math.min(this.y, wall.y + wall.height));
+      const dx = this.x - nearX;
+      const dy = this.y - nearY;
+      const distSq = dx * dx + dy * dy;
+      const r = PLAYER.RADIUS;
+
+      if (distSq < r * r && distSq > 0) {
+        // 押し出し
+        const dist = Math.sqrt(distSq);
+        const overlap = r - dist;
+        this.x += (dx / dist) * overlap;
+        this.y += (dy / dist) * overlap;
+      } else if (distSq === 0) {
+        // 中心が矩形内部にある場合（最短方向に押し出す）
+        const dl = this.x - wall.x;
+        const dr = wall.x + wall.width - this.x;
+        const dt = this.y - wall.y;
+        const db = wall.y + wall.height - this.y;
+        const min = Math.min(dl, dr, dt, db);
+        if (min === dl)      this.x = wall.x - r;
+        else if (min === dr) this.x = wall.x + wall.width + r;
+        else if (min === dt) this.y = wall.y - r;
+        else                 this.y = wall.y + wall.height + r;
+      }
+    }
+  }
+
   private draw(now: number): void {
     this.graphics.clear();
+    if (!this._alive) return;
 
     const color = PLAYER_COLORS[this.colorIndex % PLAYER_COLORS.length];
 
     // 無敵中は点滅
-    if (this.invincible && Math.floor(now / 100) % 2 === 0) {
-      // 点滅のため描画スキップ
-    } else {
-      // バリアエフェクト（外側リング）
-      if (this.hasBarrier) {
-        this.graphics.lineStyle(2, 0xffffff, 0.6);
-        this.graphics.strokeCircle(this.x, this.y, PLAYER.RADIUS + 6);
-      }
-
-      // プレイヤー本体
-      this.graphics.fillStyle(color, 1);
-      this.graphics.fillCircle(this.x, this.y, PLAYER.RADIUS);
-
-      // 内側の明るいハイライト
-      this.graphics.fillStyle(0xffffff, 0.3);
-      this.graphics.fillCircle(this.x - 4, this.y - 4, PLAYER.RADIUS * 0.4);
-
-      // 当たり判定の可視化（デバッグ用）
-      // this.graphics.lineStyle(1, 0xff0000, 0.5);
-      // this.graphics.strokeCircle(this.x, this.y, PLAYER.HITBOX_RADIUS);
+    const blinking = this.isInvincible && Math.floor(now / 100) % 2 === 0;
+    if (blinking) {
+      this.labelText.setPosition(this.x, this.y - PLAYER.RADIUS - 20);
+      return;
     }
 
-    // テキスト位置を更新
-    this.nameText.setPosition(this.x, this.y - PLAYER.RADIUS - 20);
-    this.hpText.setPosition(this.x, this.y - PLAYER.RADIUS - 6);
+    // スピードブースト中のオーラ
+    if (now < this.speedBoostUntil && this.speedMultiplier > 1) {
+      this.graphics.fillStyle(0xffff00, 0.15);
+      this.graphics.fillCircle(this.x, this.y, PLAYER.RADIUS + 8);
+    }
+
+    // バリアリング
+    if (this.hasBarrier) {
+      this.graphics.lineStyle(2, 0xffffff, 0.7 + 0.3 * Math.sin(now / 200));
+      this.graphics.strokeCircle(this.x, this.y, PLAYER.RADIUS + 7);
+    }
+
+    // ダッシュ中のエフェクト
+    if (this.isDashing) {
+      this.graphics.fillStyle(color, 0.3);
+      this.graphics.fillCircle(this.x, this.y, PLAYER.RADIUS + 4);
+    }
+
+    // プレイヤー本体（円）
+    this.graphics.fillStyle(color, 1);
+    this.graphics.fillCircle(this.x, this.y, PLAYER.RADIUS);
+
+    // 照準インジケーター（小さな矢印）
+    const aimX = this.x + this.aimDirX * (PLAYER.RADIUS + 8);
+    const aimY = this.y + this.aimDirY * (PLAYER.RADIUS + 8);
+    this.graphics.fillStyle(0xffffff, 0.8);
+    this.graphics.fillCircle(aimX, aimY, 3);
+
+    // ハイライト
+    this.graphics.fillStyle(0xffffff, 0.25);
+    this.graphics.fillCircle(this.x - 4, this.y - 4, PLAYER.RADIUS * 0.35);
+
+    // ラベル更新
+    this.labelText.setPosition(this.x, this.y - PLAYER.RADIUS - 20);
   }
 
   destroy(): void {
     this.graphics.destroy();
-    this.nameText.destroy();
-    this.hpText.destroy();
+    this.labelText.destroy();
   }
 }

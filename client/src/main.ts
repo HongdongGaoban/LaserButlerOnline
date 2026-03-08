@@ -10,46 +10,33 @@ import {
   hideLoadingScreen,
 } from './utils/MobileUtils';
 
-// スマホ対策を最初に適用
 disableMobileGestures();
 initAudioOnFirstTouch();
 
 const config: Phaser.Types.Core.GameConfig = {
-  type: Phaser.AUTO,             // WebGL優先、非対応なら Canvas にフォールバック
+  type: Phaser.AUTO,
   width: GAME_WIDTH,
   height: GAME_HEIGHT,
   backgroundColor: '#000010',
   parent: 'game-container',
   scale: {
-    mode: Phaser.Scale.FIT,      // アスペクト比を維持しながら画面にフィット
+    mode: Phaser.Scale.FIT,
     autoCenter: Phaser.Scale.CENTER_BOTH,
   },
   physics: {
     default: 'arcade',
     arcade: {
-      gravity: { x: 0, y: 0 },  // トップダウンなので重力なし
-      debug: import.meta.env.DEV,
+      gravity: { x: 0, y: 0 },
+      debug: false,
     },
   },
   input: {
-    activePointers: 3,           // 最大3本指まで追跡（移動+照準+ボタン）
-  },
-  audio: {
-    disableWebAudio: false,
+    activePointers: 3,
   },
   scene: [BootScene, LobbyScene, GameScene, ResultScene],
   callbacks: {
-    postBoot: () => {
-      hideLoadingScreen();
-    },
+    postBoot: () => { hideLoadingScreen(); },
   },
 };
 
-const game = new Phaser.Game(config);
-
-// HMR対応（開発時のみ）
-if (import.meta.hot) {
-  import.meta.hot.dispose(() => {
-    game.destroy(true);
-  });
-}
+new Phaser.Game(config);
