@@ -1,0 +1,21 @@
+{
+  "name": "laser-butler-online-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "phaser": "^3.87.0",
+    "phaser3-rex-plugins": "^1.80.15"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}
